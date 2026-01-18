@@ -1,26 +1,25 @@
+"""
+Multimodal PDF RAG Application with CLIP and GPT-4V
+Streamlit UI for asking questions about PDF documents
+"""
 import streamlit as st
-import fitz
-from langchain_core.documents import Document
-from transformers import CLIPProcessor, CLIPModel
-from PIL import Image
-import torch
-import numpy as np
-from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
-import os
-import base64
-import io
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from dotenv import load_dotenv
+
+# Import configuration
+import config
+
+# Import our modules
+from src.models import load_clip_model, load_llm
+from src.processing import process_pdf
+from src.retrieval import create_vector_store
+from src.rag import ask_question
 
 # Load environment variables
 load_dotenv()
 
 # Page configuration
 st.set_page_config(
-    page_title="Multimodal RAG with CLIP",
-    page_icon="📚",
+    page_title=config.PAGE_TITLE,
     layout="centered"
 )
 
@@ -41,8 +40,6 @@ if 'vector_store' not in st.session_state:
     st.session_state.vector_store = None
 if 'image_data_store' not in st.session_state:
     st.session_state.image_data_store = {}
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
 if 'clip_model' not in st.session_state:
     st.session_state.clip_model = None
 if 'clip_processor' not in st.session_state:
@@ -58,172 +55,19 @@ if 'last_question' not in st.session_state:
 if 'current_answer' not in st.session_state:
     st.session_state.current_answer = ""
 
-# Functions
+
 @st.cache_resource(show_spinner=False)
 def load_models():
-    """Load CLIP model and LLM"""
-    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-    clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    clip_model.eval()
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    """Load CLIP model and LLM (cached for performance)"""
+    clip_model, clip_processor = load_clip_model()
+    llm = load_llm()
     return clip_model, clip_processor, llm
 
-def embed_image(image_data, clip_model, clip_processor):
-    """Embed an image using CLIP"""
-    if isinstance(image_data, str):
-        image = Image.open(image_data).convert("RGB")
-    else:
-        image = image_data
-
-    inputs = clip_processor(images=image, return_tensors="pt")
-    with torch.no_grad():
-        features = clip_model.get_image_features(**inputs)
-        features = features / features.norm(dim=-1, keepdim=True)
-        return features.squeeze().numpy()
-
-def embed_text(text, clip_model, clip_processor):
-    """Embed text using CLIP"""
-    inputs = clip_processor(
-        text=text,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=77
-    )
-    with torch.no_grad():
-        features = clip_model.get_text_features(**inputs)
-        features = features / features.norm(dim=-1, keepdim=True)
-        return features.squeeze().numpy()
-
-def process_pdf(pdf_file, clip_model, clip_processor):
-    """Process uploaded PDF and extract text and images"""
-    with open("temp.pdf", "wb") as f:
-        f.write(pdf_file.getbuffer())
-    
-    doc = fitz.open("temp.pdf")
-    all_docs = []
-    all_embeddings = []
-    image_data_store = {}
-    
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    
-    # progress_bar = st.progress(0)
-    total_pages = len(doc)
-    
-    for i, page in enumerate(doc):
-        # progress_bar.progress((i + 1) / total_pages)
-        
-        # Process text
-        text = page.get_text()
-        if text.strip():
-            temp_doc = Document(page_content=text, metadata={"page": i, "type": "text"})
-            text_chunks = splitter.split_documents([temp_doc])
-            
-            for chunk in text_chunks:
-                embedding = embed_text(chunk.page_content, clip_model, clip_processor)
-                all_embeddings.append(embedding)
-                all_docs.append(chunk)
-        
-        # Process images
-        for img_index, img in enumerate(page.get_images(full=True)):
-            try:
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                
-                pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                image_id = f"page_{i}_img_{img_index}"
-                
-                buffered = io.BytesIO()
-                pil_image.save(buffered, format="PNG")
-                image_base64 = base64.b64encode(buffered.getvalue()).decode()
-                image_data_store[image_id] = image_base64
-                
-                embedding = embed_image(pil_image, clip_model, clip_processor)
-                all_embeddings.append(embedding)
-                
-                image_doc = Document(
-                    page_content=f"[Image: {image_id}]",
-                    metadata={"page": i, "type": "image", "image_id": image_id}
-                )
-                all_docs.append(image_doc)
-            except:
-                continue
-    
-    doc.close()
-    # progress_bar.empty()
-    
-    # Create FAISS vector store
-    embeddings_array = np.array(all_embeddings)
-    vector_store = FAISS.from_embeddings(
-        text_embeddings=[(doc.page_content, emb) for doc, emb in zip(all_docs, embeddings_array)],
-        embedding=None,
-        metadatas=[doc.metadata for doc in all_docs]
-    )
-    
-    os.remove("temp.pdf")
-    
-    return image_data_store, vector_store
-
-def retrieve_multimodal(query, vector_store, clip_model, clip_processor, k=5):
-    """Unified retrieval using CLIP"""
-    query_embedding = embed_text(query, clip_model, clip_processor)
-    results = vector_store.similarity_search_by_vector(
-        embedding=query_embedding,
-        k=k
-    )
-    return results
-
-def create_multimodal_message(query, retrieved_docs, image_data_store):
-    """Create a message with both text and images for GPT-4V"""
-    content = []
-    
-    content.append({
-        "type": "text",
-        "text": f"Question: {query}\n\nContext:\n"
-    })
-    
-    text_docs = [doc for doc in retrieved_docs if doc.metadata.get("type") == "text"]
-    image_docs = [doc for doc in retrieved_docs if doc.metadata.get("type") == "image"]
-    
-    if text_docs:
-        text_context = "\n\n".join([
-            f"[Page {doc.metadata['page']}]: {doc.page_content}"
-            for doc in text_docs
-        ])
-        content.append({
-            "type": "text",
-            "text": f"Text excerpts:\n{text_context}\n"
-        })
-    
-    for doc in image_docs:
-        image_id = doc.metadata.get("image_id")
-        if image_id and image_id in image_data_store:
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/png;base64,{image_data_store[image_id]}"
-                }
-            })
-    
-    content.append({
-        "type": "text",
-        "text": "\n\nPlease answer the question based on the provided text and images."
-    })
-    
-    return HumanMessage(content=content)
-
-def ask_question(query, vector_store, image_data_store, llm, clip_model, clip_processor):
-    """Main pipeline for multimodal RAG"""
-    context_docs = retrieve_multimodal(query, vector_store, clip_model, clip_processor, k=5)
-    message = create_multimodal_message(query, context_docs, image_data_store)
-    response = llm.invoke([message])
-    return response.content
 
 # Main UI
 st.markdown('<div class="main-header">', unsafe_allow_html=True)
-st.title("Ask your PDF 📚")
-st.markdown("Upload your document and ask questions about it")
+st.title(config.APP_TITLE)
+st.markdown(config.APP_SUBTITLE)
 st.markdown('</div>', unsafe_allow_html=True)
 
 # File upload section - always visible
@@ -243,12 +87,16 @@ if uploaded_file is not None:
                 st.session_state.llm = llm
             
             # Process the PDF
-            image_data_store, vector_store = process_pdf(
+            image_data_store, all_docs, all_embeddings = process_pdf(
                 uploaded_file,
                 st.session_state.clip_model,
                 st.session_state.clip_processor
             )
             
+            # Create vector store
+            vector_store = create_vector_store(all_docs, all_embeddings)
+            
+            # Store in session state
             st.session_state.image_data_store = image_data_store
             st.session_state.vector_store = vector_store
             st.session_state.processed = True
@@ -264,7 +112,7 @@ if st.session_state.processed:
     # Question input - no form, question stays visible
     question = st.text_input(
         "Your question:",
-        placeholder="",
+        placeholder=config.QUESTION_PLACEHOLDER,
         label_visibility="collapsed",
         key="question_input"
     )
